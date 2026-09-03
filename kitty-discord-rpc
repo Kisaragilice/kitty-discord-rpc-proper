@@ -1,0 +1,948 @@
+#!/usr/bin/env python3
+import glob
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+from pypresence import Presence
+
+
+CLIENT_ID = os.environ.get("KITTY_RPC_CLIENT_ID", "").strip()
+POLL_SECONDS = float(os.environ.get("KITTY_RPC_POLL", "2"))
+DEBUG = os.environ.get("KITTY_RPC_DEBUG", "0") == "1"
+
+# Berapa lama Discord Activity dipertahankan jika semua socket
+# Kitty sementara tidak bisa dibaca.
+#
+# Contoh:
+#   pindah workspace       -> tetap tampil
+#   Kitty sempat restart   -> tetap tampil beberapa detik
+#   Kitty benar-benar mati -> setelah grace period, Activity di-clear
+GRACE_SECONDS = float(
+    os.environ.get("KITTY_RPC_GRACE_SECONDS", "10")
+)
+
+# Scan semua socket Kitty yang kita buat lewat:
+# listen_on unix:/tmp/kitty-rpc-{kitty_pid}
+KITTY_SOCKET_GLOB = os.environ.get(
+    "KITTY_RPC_SOCKET_GLOB",
+    "/tmp/kitty-rpc-*",
+)
+
+# State persistent untuk mengingat Kitty terakhir.
+STATE_HOME = Path(
+    os.environ.get(
+        "XDG_STATE_HOME",
+        str(Path.home() / ".local" / "state"),
+    )
+)
+
+STATE_DIR = STATE_HOME / "kitty-discord-rpc"
+LAST_KITTY_FILE = STATE_DIR / "last-kitty.json"
+
+
+if not CLIENT_ID:
+    raise SystemExit(
+        "KITTY_RPC_CLIENT_ID is not set. "
+        "Set Discord Application ID in the systemd service."
+    )
+
+
+# ============================================================
+# Discord labels
+# ============================================================
+
+LABELS = {
+    "ssh": "Connected via SSH",
+    "mosh": "Connected to a remote host",
+    "yazi": "Browsing files",
+    "btop": "Monitoring the system",
+    "htop": "Monitoring the system",
+    "top": "Monitoring the system",
+    "git": "Working with Git",
+    "lazygit": "Working with Git",
+    "docker": "Working with containers",
+    "lazydocker": "Managing containers",
+    "podman": "Working with containers",
+    "python": "Running Python",
+    "python3": "Running Python",
+    "pacman": "Managing Arch Linux",
+    "paru": "Managing Arch Linux",
+    "yay": "Managing Arch Linux",
+    "systemctl": "Managing services",
+    "journalctl": "Reading system logs",
+}
+
+
+# ============================================================
+# Discord assets
+# ============================================================
+
+ASSETS = {
+    "btop": "btop",
+    "htop": "btop",
+    "top": "btop",
+    "yazi": "yazi",
+    "ssh": "ssh",
+    "mosh": "ssh",
+    "git": "git",
+    "lazygit": "git",
+    "docker": "docker",
+    "lazydocker": "docker",
+    "podman": "docker",
+    "python": "python",
+    "python3": "python",
+    "pacman": "arch",
+    "paru": "arch",
+    "yay": "arch",
+}
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+def log(msg):
+    if DEBUG:
+        print(
+            f"kitty-discord-rpc: {msg}",
+            flush=True,
+        )
+
+
+# ============================================================
+# Persistent last Kitty state
+# ============================================================
+
+def load_last_kitty():
+    """
+    Load identity Kitty terakhir yang diketahui.
+
+    Format:
+    {
+        "socket": "/tmp/kitty-rpc-12345",
+        "os_window_id": 1,
+        "tab_id": 2,
+        "window_id": 3
+    }
+    """
+
+    try:
+        if not LAST_KITTY_FILE.exists():
+            return None
+
+        data = json.loads(
+            LAST_KITTY_FILE.read_text()
+        )
+
+        if not isinstance(data, dict):
+            return None
+
+        return data
+
+    except Exception as exc:
+        log(
+            f"failed loading last Kitty state: {exc}"
+        )
+
+        return None
+
+
+def save_last_kitty(identity):
+    """
+    Simpan Kitty terakhir secara atomic.
+    """
+
+    try:
+        STATE_DIR.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        temp_file = LAST_KITTY_FILE.with_suffix(
+            ".tmp"
+        )
+
+        temp_file.write_text(
+            json.dumps(
+                identity,
+                indent=2,
+            )
+        )
+
+        temp_file.replace(
+            LAST_KITTY_FILE
+        )
+
+    except Exception as exc:
+        log(
+            f"failed saving last Kitty state: {exc}"
+        )
+
+
+def kitty_identity(
+    socket_path,
+    os_window,
+    tab,
+    win,
+):
+    """
+    Buat identity unik untuk satu Kitty window.
+
+    Socket penting karena dua instance Kitty bisa saja
+    memiliki ID window/tab yang sama.
+    """
+
+    return {
+        "socket": socket_path,
+        "os_window_id": os_window.get("id"),
+        "tab_id": tab.get("id"),
+        "window_id": win.get("id"),
+    }
+
+
+def same_identity(a, b):
+    if not a or not b:
+        return False
+
+    return (
+        a.get("socket") == b.get("socket")
+        and a.get("os_window_id")
+        == b.get("os_window_id")
+        and a.get("tab_id")
+        == b.get("tab_id")
+        and a.get("window_id")
+        == b.get("window_id")
+    )
+
+
+# ============================================================
+# Kitty remote control
+# ============================================================
+
+def kitty_ls_all():
+    """
+    Baca semua instance Kitty melalui Unix socket.
+
+    Tidak memakai:
+        kitten @ ls
+
+    karena systemd service tidak memiliki /dev/tty.
+    """
+
+    trees = []
+
+    sockets = sorted(
+        glob.glob(KITTY_SOCKET_GLOB)
+    )
+
+    if not sockets:
+        log(
+            f"no Kitty sockets found: "
+            f"{KITTY_SOCKET_GLOB}"
+        )
+
+        return trees
+
+    for socket_path in sockets:
+        try:
+            p = subprocess.run(
+                [
+                    "kitten",
+                    "@",
+                    "--to",
+                    f"unix:{socket_path}",
+                    "ls",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=2,
+            )
+
+            if p.returncode != 0:
+                log(
+                    f"socket failed: {socket_path}: "
+                    f"{p.stderr.strip()}"
+                )
+
+                continue
+
+            tree = json.loads(
+                p.stdout
+            )
+
+            if isinstance(tree, list):
+                # Simpan socket asal bersama tree.
+                trees.append(
+                    (
+                        socket_path,
+                        tree,
+                    )
+                )
+
+        except Exception as exc:
+            log(
+                f"failed reading "
+                f"{socket_path}: {exc}"
+            )
+
+    return trees
+
+
+def iter_windows(tree):
+    for os_window in tree:
+        for tab in os_window.get(
+            "tabs",
+            [],
+        ):
+            for window in tab.get(
+                "windows",
+                [],
+            ):
+                yield (
+                    os_window,
+                    tab,
+                    window,
+                )
+
+
+# ============================================================
+# Process inspection
+# ============================================================
+
+def proc_stat(pid):
+    try:
+        text = Path(
+            f"/proc/{pid}/stat"
+        ).read_text()
+
+        right = text.rfind(")")
+
+        fields = text[
+            right + 2:
+        ].split()
+
+        return {
+            "state": fields[0],
+            "pgrp": int(fields[2]),
+            "tty_nr": int(fields[4]),
+            "tpgid": int(fields[5]),
+        }
+
+    except (
+        OSError,
+        ValueError,
+        IndexError,
+    ):
+        return None
+
+
+def process_info(pid):
+    try:
+        raw = Path(
+            f"/proc/{pid}/cmdline"
+        ).read_bytes().split(b"\0")
+
+        argv = [
+            x.decode(errors="replace")
+            for x in raw
+            if x
+        ]
+
+        if argv:
+            return (
+                os.path.basename(argv[0]),
+                argv,
+            )
+
+    except OSError:
+        pass
+
+    try:
+        return (
+            Path(
+                f"/proc/{pid}/comm"
+            ).read_text().strip(),
+            [],
+        )
+
+    except OSError:
+        return (
+            "Terminal",
+            [],
+        )
+
+
+def find_foreground(pid):
+    """
+    Cari process foreground yang memakai TTY
+    milik Kitty window tersebut.
+    """
+
+    st = proc_stat(pid)
+
+    if (
+        not st
+        or st["tty_nr"] == 0
+        or st["tpgid"] <= 0
+    ):
+        return None
+
+    matches = []
+
+    try:
+        proc_entries = Path(
+            "/proc"
+        ).iterdir()
+
+    except OSError:
+        return None
+
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+
+        p = int(entry.name)
+
+        s = proc_stat(p)
+
+        if not s:
+            continue
+
+        if (
+            s["tty_nr"] == st["tty_nr"]
+            and s["pgrp"] == st["tpgid"]
+            and s["state"] != "Z"
+        ):
+            name, argv = process_info(p)
+
+            matches.append(
+                (
+                    p,
+                    name,
+                    argv,
+                )
+            )
+
+    if not matches:
+        return None
+
+    shells = {
+        "bash",
+        "zsh",
+        "fish",
+        "sh",
+        "dash",
+        "nu",
+        "nushell",
+    }
+
+    non_shell = [
+        item
+        for item in matches
+        if item[1] not in shells
+    ]
+
+    return max(
+        non_shell or matches,
+        key=lambda item: item[0],
+    )
+
+
+# ============================================================
+# Formatting
+# ============================================================
+
+def short_path(path):
+    if not path:
+        return "Kitty terminal"
+
+    home = str(
+        Path.home()
+    )
+
+    if path.startswith(home):
+        path = "~" + path[
+            len(home):
+        ]
+
+    return (
+        path.rstrip("/")
+        or "/"
+    )
+
+
+# ============================================================
+# Window collection
+# ============================================================
+
+def collect_kitty_windows():
+    """
+    Ambil semua Kitty window dari semua socket.
+
+    Return:
+        [
+            {
+                "identity": {...},
+                "socket": "...",
+                "os_window": {...},
+                "tab": {...},
+                "window": {...},
+                "focused": bool,
+                "active": bool,
+                "command": "...",
+                "argv": [...],
+                "cwd": "...",
+                "title": "...",
+                "tab_title": "..."
+            }
+        ]
+    """
+
+    candidates = []
+
+    socket_trees = kitty_ls_all()
+
+    for socket_path, tree in socket_trees:
+        for (
+            os_window,
+            tab,
+            win,
+        ) in iter_windows(tree):
+
+            pid = win.get("pid")
+
+            fg = (
+                find_foreground(pid)
+                if pid
+                else None
+            )
+
+            if fg:
+                _, command, argv = fg
+            else:
+                command, argv = (
+                    "Terminal",
+                    [],
+                )
+
+            command = os.path.basename(
+                command
+                or "Terminal"
+            )
+
+            identity = kitty_identity(
+                socket_path,
+                os_window,
+                tab,
+                win,
+            )
+
+            candidates.append(
+                {
+                    "identity": identity,
+                    "socket": socket_path,
+                    "os_window": os_window,
+                    "tab": tab,
+                    "window": win,
+                    "focused": bool(
+                        os_window.get(
+                            "is_focused"
+                        )
+                    )
+                    and bool(
+                        win.get(
+                            "is_focused"
+                        )
+                    ),
+                    "active": bool(
+                        win.get(
+                            "is_active",
+                            True,
+                        )
+                    ),
+                    "command": command,
+                    "argv": argv,
+                    "cwd": short_path(
+                        win.get("cwd")
+                        or ""
+                    ),
+                    "title": (
+                        win.get("title")
+                        or ""
+                    ),
+                    "tab_title": (
+                        tab.get("title")
+                        or ""
+                    ),
+                }
+            )
+
+    return candidates
+
+
+# ============================================================
+# Select Kitty
+# ============================================================
+
+def active_kitty_window(last_identity):
+    """
+    Pilih Kitty berdasarkan prioritas:
+
+    1. Kitty yang sedang focused.
+    2. Kitty yang terakhir focused/diingat.
+    3. Kitty window pertama yang tersedia.
+
+    Yang paling penting:
+    pindah workspace TIDAK membuat hasil menjadi None.
+    """
+
+    candidates = (
+        collect_kitty_windows()
+    )
+
+    if not candidates:
+        return None
+
+    # --------------------------------------------------------
+    # PRIORITY 1
+    #
+    # Ada Kitty yang sedang focused?
+    # --------------------------------------------------------
+
+    focused = [
+        item
+        for item in candidates
+        if item["focused"]
+    ]
+
+    if focused:
+        selected = focused[0]
+
+        save_last_kitty(
+            selected["identity"]
+        )
+
+        log(
+            "focused Kitty selected: "
+            f'{selected["socket"]} '
+            f'window={selected["identity"]["window_id"]} '
+            f'command={selected["command"]}'
+        )
+
+        return selected
+
+    # --------------------------------------------------------
+    # PRIORITY 2
+    #
+    # Tidak ada Kitty focused.
+    # Cari Kitty yang terakhir digunakan.
+    # --------------------------------------------------------
+
+    if last_identity:
+        for item in candidates:
+            if same_identity(
+                item["identity"],
+                last_identity,
+            ):
+                log(
+                    "using remembered Kitty: "
+                    f'{item["socket"]} '
+                    f'window={item["identity"]["window_id"]} '
+                    f'command={item["command"]}'
+                )
+
+                return item
+
+    # --------------------------------------------------------
+    # PRIORITY 3
+    #
+    # Tidak punya memory yang cocok.
+    # Pilih Kitty pertama.
+    # --------------------------------------------------------
+
+    selected = candidates[0]
+
+    save_last_kitty(
+        selected["identity"]
+    )
+
+    log(
+        "fallback Kitty selected: "
+        f'{selected["socket"]} '
+        f'window={selected["identity"]["window_id"]} '
+        f'command={selected["command"]}'
+    )
+
+    return selected
+
+
+# ============================================================
+# Discord Activity description
+# ============================================================
+
+def describe(item):
+    command = item["command"]
+    cwd = item["cwd"]
+
+    details = LABELS.get(
+        command,
+        "Using the terminal",
+    )
+
+    state = (
+        command
+        if command != "Terminal"
+        else cwd
+    )
+
+    # SSH target
+    if (
+        command in {
+            "ssh",
+            "mosh",
+        }
+        and len(item["argv"]) > 1
+    ):
+        target = next(
+            (
+                arg
+                for arg in reversed(
+                    item["argv"][1:]
+                )
+                if not arg.startswith("-")
+            ),
+            "",
+        )
+
+        if target:
+            state = target
+
+    asset = ASSETS.get(
+        command,
+        "terminal",
+    )
+
+    return {
+        "details": details[:128],
+        "state": state[:128],
+        "large_image": asset,
+        "large_text": (
+            f"Kitty • {command}"
+        ),
+        "small_image": "kitty",
+        "small_text": (
+            "Kitty terminal"
+        ),
+    }
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    rpc = None
+
+    last_key = None
+    last_identity = load_last_kitty()
+
+    activity_started = int(
+        time.time()
+    )
+
+    # Saat terakhir Kitty masih berhasil ditemukan.
+    last_seen_kitty = None
+
+    backoff = 2
+
+    if last_identity:
+        log(
+            "loaded remembered Kitty: "
+            f'{last_identity.get("socket")} '
+            f'window={last_identity.get("window_id")}'
+        )
+
+    while True:
+        try:
+            rpc = Presence(
+                CLIENT_ID
+            )
+
+            rpc.connect()
+
+            log(
+                "connected to Discord RPC"
+            )
+
+            backoff = 2
+
+            while True:
+
+                item = active_kitty_window(
+                    last_identity
+                )
+
+                # ------------------------------------------------
+                # Tidak ada Kitty sama sekali.
+                # ------------------------------------------------
+
+                if item is None:
+
+                    # Kalau sebelumnya ada Kitty,
+                    # jangan langsung clear.
+                    if (
+                        last_seen_kitty is not None
+                        and (
+                            time.monotonic()
+                            - last_seen_kitty
+                        ) < GRACE_SECONDS
+                    ):
+                        log(
+                            "no Kitty currently "
+                            "available; keeping "
+                            "last Discord Activity "
+                            f"for {GRACE_SECONDS}s grace period"
+                        )
+
+                        time.sleep(
+                            POLL_SECONDS
+                        )
+
+                        continue
+
+                    # Grace period habis.
+                    if last_key is not None:
+                        log(
+                            "no Kitty found; "
+                            "clearing Discord Activity"
+                        )
+
+                        try:
+                            rpc.clear()
+                        except Exception as exc:
+                            log(
+                                f"rpc.clear failed: {exc}"
+                            )
+
+                        last_key = None
+
+                    time.sleep(
+                        POLL_SECONDS
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # Kitty ditemukan.
+                # ------------------------------------------------
+
+                last_seen_kitty = (
+                    time.monotonic()
+                )
+
+                # Identity baru menjadi memory terbaru.
+                if not same_identity(
+                    item["identity"],
+                    last_identity,
+                ):
+                    last_identity = (
+                        item["identity"]
+                    )
+
+                    save_last_kitty(
+                        last_identity
+                    )
+
+                    log(
+                        "remembered new Kitty: "
+                        f'{item["socket"]} '
+                        f'window={item["identity"]["window_id"]}'
+                    )
+
+                # ------------------------------------------------
+                # Generate Discord Activity
+                # ------------------------------------------------
+
+                payload = describe(
+                    item
+                )
+
+                key = tuple(
+                    payload.items()
+                )
+
+                # Hanya update Discord kalau Activity
+                # benar-benar berubah.
+                if key != last_key:
+
+                    activity_started = int(
+                        time.time()
+                    )
+
+                    rpc.update(
+                        details=payload[
+                            "details"
+                        ],
+                        state=payload[
+                            "state"
+                        ],
+                        start=activity_started,
+                        large_image=payload[
+                            "large_image"
+                        ],
+                        large_text=payload[
+                            "large_text"
+                        ],
+                        small_image=payload[
+                            "small_image"
+                        ],
+                        small_text=payload[
+                            "small_text"
+                        ],
+                    )
+
+                    log(
+                        f'{payload["details"]} | '
+                        f'{payload["state"]} | '
+                        f'{payload["large_image"]}'
+                    )
+
+                    last_key = key
+
+                time.sleep(
+                    POLL_SECONDS
+                )
+
+        except KeyboardInterrupt:
+            break
+
+        except Exception as exc:
+            print(
+                f"kitty-discord-rpc: {exc}",
+                flush=True,
+            )
+
+            last_key = None
+
+            try:
+                if rpc:
+                    rpc.close()
+            except Exception:
+                pass
+
+            time.sleep(
+                backoff
+            )
+
+            backoff = min(
+                backoff * 2,
+                30,
+            )
+
+
+if __name__ == "__main__":
+    main()
+

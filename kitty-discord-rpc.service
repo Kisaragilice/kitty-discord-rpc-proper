@@ -1,0 +1,15 @@
+[Unit]
+Description=Kitty Discord Rich Presence
+After=graphical-session.target
+
+[Service]
+Type=simple
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/.config/kitty-discord-rpc/env
+ExecStart=%h/.local/share/kitty-discord-rpc/venv/bin/python %h/.local/bin/kitty-discord-rpc
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
