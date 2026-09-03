@@ -88,7 +88,7 @@ Clone the repository:
 
 ```bash
 git clone https://github.com/Kisaragilice/kitty-discord-rpc-proper
-cd kitty-discord-rpc
+cd kitty-discord-rpc-proper
 ```
 
 Make the installer executable if necessary:
